@@ -118,6 +118,30 @@ npm start /ext
 | 브라우저 | 기존 Chrome | 별도 Chrome |
 | 추천 용도 | 로그인 필요 서비스 | 일반 웹 탐색 |
 
+### 병렬 처리 모드 (Multi-Profile)
+
+여러 Chrome 프로필로 동시에 작업을 실행합니다. 각 프로필은 별도의 로그인 상태를 유지합니다.
+
+```bash
+# 프로필 목록 확인
+npm start /profiles
+
+# 2개 프로필로 2개 작업 병렬 실행
+npm start '/parallel "Default,Profile 1" "네이버에서 날씨 검색" "구글에서 뉴스 검색"'
+
+# 3개 프로필로 6개 작업 병렬 실행 (라운드 로빈 배분)
+npm start '/parallel "Default,Profile 1,Profile 2" "작업1" "작업2" "작업3" "작업4" "작업5" "작업6"'
+```
+
+#### 병렬 처리 특징
+
+- 각 프로필별로 독립된 Chrome 인스턴스 실행
+- 작업 수 > 프로필 수인 경우 라운드 로빈으로 자동 배분
+- 모든 작업이 동시에 실행되어 처리 시간 단축
+- 각 프로필의 로그인 상태 유지
+
+**주의**: 병렬 실행 전 해당 프로필을 사용하는 Chrome을 종료해야 합니다.
+
 ### 모델 관리
 
 ```bash
@@ -172,9 +196,10 @@ npm start '/ollama-url http://192.168.1.100:11434/v1'
 | 명령어 | 설명 | 예시 |
 |--------|------|------|
 | `/ext` 또는 `/extension` | Extension 모드로 시작 | `npm start /ext` |
+| `/parallel` | 멀티 프로필 병렬 실행 | `npm start '/parallel "Default,Profile 1" "작업1" "작업2"'` |
+| `/profiles` | Chrome 프로필 목록 | `npm start /profiles` |
 | `/models` | 사용 가능한 모델 목록 | `npm start /models` |
 | `/set <provider> <model>` | 모델 변경 | `npm start '/set google gemini-2.5-flash'` |
-| `/ollama-url <url>` | Ollama URL 설정 | `npm start '/ollama-url http://localhost:11434/v1'` |
 | `/config` | 현재 설정 확인 | `npm start /config` |
 | `/help` | 도움말 | `npm start /help` |
 | `exit` | 종료 (대화형 모드) | - |

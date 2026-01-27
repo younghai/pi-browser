@@ -142,6 +142,322 @@ let chromeProcess: RunningChrome | null = null;
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 
+// ============================================================
+// 병렬 브라우저 관리
+// ============================================================
+interface ParallelBrowser {
+  id: number;
+  profile: string;
+  process: ChildProcess | null;
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+  cdpPort: number;
+}
+
+const parallelBrowsers: ParallelBrowser[] = [];
+
+// 병렬 브라우저 시작
+async function startParallelBrowsers(profiles: string[]): Promise<ParallelBrowser[]> {
+  const executablePath = findChromeExecutable();
+  if (!executablePath) throw new Error("Chrome not found");
+
+  const chromeDir = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+  const browsers: ParallelBrowser[] = [];
+
+  console.log(`\n${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}`);
+  console.log(`${c.bright}🚀 병렬 브라우저 시작 (${profiles.length}개 프로필)${c.reset}`);
+  console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}\n`);
+
+  for (let i = 0; i < profiles.length; i++) {
+    const profile = profiles[i];
+    const cdpPort = 9500 + i; // 9500, 9501, 9502, ...
+
+    // 프로필 존재 확인
+    const profilePath = path.join(chromeDir, profile);
+    if (!fs.existsSync(profilePath)) {
+      console.log(`${c.red}  ✗ 프로필 없음: ${profile}${c.reset}`);
+      continue;
+    }
+
+    console.log(`${c.dim}  [${i + 1}/${profiles.length}] ${profile} 시작 중... (포트 ${cdpPort})${c.reset}`);
+
+    const args = [
+      `--remote-debugging-port=${cdpPort}`,
+      `--user-data-dir=${chromeDir}`,
+      `--profile-directory=${profile}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-sync",
+      "about:blank",
+    ];
+
+    const proc = spawn(executablePath, args, {
+      detached: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const cdpUrl = `http://127.0.0.1:${cdpPort}`;
+
+    // CDP 준비 대기
+    let cdpReady = false;
+    for (let j = 0; j < 30; j++) {
+      try {
+        const res = await fetch(`${cdpUrl}/json/version`, { signal: AbortSignal.timeout(500) });
+        if (res.ok) {
+          cdpReady = true;
+          break;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    if (!cdpReady) {
+      console.log(`${c.red}  ✗ CDP 연결 실패: ${profile}${c.reset}`);
+      proc.kill();
+      continue;
+    }
+
+    try {
+      const browserInstance = await chromium.connectOverCDP(cdpUrl);
+      const contexts = browserInstance.contexts();
+      const ctx = contexts[0] ?? (await browserInstance.newContext());
+      const pages = ctx.pages();
+      const page = pages[0] ?? (await ctx.newPage());
+
+      const pb: ParallelBrowser = {
+        id: i,
+        profile,
+        process: proc,
+        browser: browserInstance,
+        context: ctx,
+        page,
+        cdpPort,
+      };
+
+      browsers.push(pb);
+      parallelBrowsers.push(pb);
+
+      console.log(`${c.green}  ✓ ${profile} 준비 완료${c.reset}`);
+    } catch (error) {
+      console.log(`${c.red}  ✗ 브라우저 연결 실패: ${profile} - ${(error as Error).message}${c.reset}`);
+      proc.kill();
+    }
+  }
+
+  console.log(`\n${c.green}✓ ${browsers.length}개 브라우저 준비 완료${c.reset}\n`);
+  return browsers;
+}
+
+// 병렬 브라우저 종료
+async function stopParallelBrowsers(): Promise<void> {
+  for (const pb of parallelBrowsers) {
+    try {
+      await pb.browser.close();
+    } catch {}
+    if (pb.process) {
+      pb.process.kill("SIGTERM");
+    }
+  }
+  parallelBrowsers.length = 0;
+}
+
+// 병렬 에이전트 실행
+async function runParallelAgents(
+  browsers: ParallelBrowser[],
+  tasks: string[],
+  model: Model,
+  isOllama: boolean
+): Promise<void> {
+  console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}`);
+  console.log(`${c.bright}🎯 병렬 작업 시작 (${tasks.length}개 작업)${c.reset}`);
+  console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}\n`);
+
+  // 작업 배분 (라운드 로빈)
+  const assignments: { browser: ParallelBrowser; task: string; index: number }[] = [];
+  for (let i = 0; i < tasks.length; i++) {
+    const browserIdx = i % browsers.length;
+    assignments.push({
+      browser: browsers[browserIdx],
+      task: tasks[i],
+      index: i,
+    });
+  }
+
+  // 각 브라우저별로 작업 표시
+  for (const browser of browsers) {
+    const browserTasks = assignments.filter((a) => a.browser.id === browser.id);
+    console.log(`${c.yellow}[${browser.profile}]${c.reset} ${browserTasks.length}개 작업`);
+    for (const a of browserTasks) {
+      console.log(`  ${c.dim}${a.index + 1}. ${a.task.slice(0, 50)}...${c.reset}`);
+    }
+  }
+  console.log();
+
+  // 병렬 실행
+  const results = await Promise.allSettled(
+    assignments.map(async ({ browser, task, index }) => {
+      console.log(`${c.blue}[${browser.profile}]${c.reset} ${c.bright}작업 ${index + 1} 시작${c.reset}`);
+      await runParallelAgentSingle(browser, task, model, isOllama, index);
+      console.log(`${c.green}[${browser.profile}]${c.reset} ${c.bright}작업 ${index + 1} 완료${c.reset}\n`);
+    })
+  );
+
+  // 결과 요약
+  const succeeded = results.filter((r) => r.status === "fulfilled").length;
+  const failed = results.filter((r) => r.status === "rejected").length;
+
+  console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}`);
+  console.log(`${c.bright}📊 병렬 작업 완료${c.reset}`);
+  console.log(`  ${c.green}성공: ${succeeded}${c.reset} / ${c.red}실패: ${failed}${c.reset}`);
+  console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}\n`);
+}
+
+// 단일 병렬 에이전트 실행
+async function runParallelAgentSingle(
+  pb: ParallelBrowser,
+  mission: string,
+  model: Model,
+  isOllama: boolean,
+  taskIndex: number
+): Promise<void> {
+  const prefix = `[${pb.profile}:${taskIndex + 1}]`;
+
+  const ctx: Context = {
+    systemPrompt: `You are a browser automation agent. Complete the user's mission using browser tools.
+
+TOOLS:
+- browser_navigate: {"url": "https://..."} - Go to URL
+- browser_snapshot: {} - Get interactive elements with selectors
+- browser_fill: {"selector": "...", "text": "..."} - Type text
+- browser_click: {"selector": "..."} - Click element
+- browser_press: {"key": "Enter"} - Press key
+- browser_screenshot: {} - Capture screen
+- browser_get_text: {"selector": ""} - Get page text
+
+Be concise. Complete the full task autonomously.`,
+    messages: [{ role: "user", content: mission }],
+    tools: browserTools,
+  };
+
+  const maxTurns = 50;
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    let response: AssistantMessage;
+
+    try {
+      const streamOptions = isOllama ? { apiKey: "ollama" } : undefined;
+      const s = streamSimple(model, ctx, streamOptions);
+
+      for await (const event of s) {
+        // 병렬 실행 시 출력 최소화
+      }
+
+      response = await s.result();
+    } catch (error) {
+      console.log(`${c.red}${prefix} Error: ${(error as Error).message}${c.reset}`);
+      break;
+    }
+
+    ctx.messages.push(response);
+
+    const toolCalls = response.content.filter((b) => b.type === "toolCall");
+
+    if (toolCalls.length === 0) {
+      break;
+    }
+
+    for (const call of toolCalls) {
+      try {
+        const result = await executeParallelBrowserTool(pb, call.name, call.arguments as Record<string, unknown>);
+
+        ctx.messages.push({
+          role: "toolResult",
+          toolCallId: call.id,
+          toolName: call.name,
+          content: [{ type: "text", text: result.text }],
+          isError: false,
+          timestamp: Date.now(),
+        });
+      } catch (error) {
+        ctx.messages.push({
+          role: "toolResult",
+          toolCallId: call.id,
+          toolName: call.name,
+          content: [{ type: "text", text: `Error: ${(error as Error).message}` }],
+          isError: true,
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+}
+
+// 병렬 브라우저용 도구 실행
+async function executeParallelBrowserTool(
+  pb: ParallelBrowser,
+  name: string,
+  args: Record<string, unknown>
+): Promise<{ text: string; image?: { data: string; mimeType: string } }> {
+  const page = pb.page;
+
+  switch (name) {
+    case "browser_navigate": {
+      const url = args.url as string;
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      return { text: `Navigated to ${url}` };
+    }
+
+    case "browser_click": {
+      const selector = args.selector as string;
+      await page.click(selector, { timeout: 10000 });
+      return { text: `Clicked: ${selector}` };
+    }
+
+    case "browser_fill": {
+      const selector = args.selector as string;
+      const text = args.text as string;
+      await page.fill(selector, text);
+      return { text: `Filled "${text}" into ${selector}` };
+    }
+
+    case "browser_press": {
+      const key = args.key as string;
+      await page.keyboard.press(key);
+      return { text: `Pressed ${key}` };
+    }
+
+    case "browser_screenshot": {
+      const buffer = await page.screenshot({ type: "png" });
+      const base64 = buffer.toString("base64");
+      return {
+        text: "Screenshot taken",
+        image: { data: base64, mimeType: "image/png" },
+      };
+    }
+
+    case "browser_snapshot": {
+      const snapshot = await page.accessibility.snapshot();
+      return { text: JSON.stringify(snapshot, null, 2) };
+    }
+
+    case "browser_scroll": {
+      const direction = args.direction as string;
+      const amount = direction === "up" ? -500 : 500;
+      await page.evaluate((y) => window.scrollBy(0, y), amount);
+      return { text: `Scrolled ${direction}` };
+    }
+
+    case "browser_get_text": {
+      const text = await page.innerText("body");
+      return { text: text.slice(0, 5000) };
+    }
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
 function findChromeExecutable(): string | null {
   const platform = os.platform();
   const paths: string[] =
@@ -1022,7 +1338,8 @@ ${c.cyan}╔══════════════════════�
 ║   ${c.dim}명령어:${c.cyan}                                                    ║
 ║   ${c.green}/models${c.cyan} - 사용 가능한 모델 목록                           ║
 ║   ${c.green}/set <provider> <model>${c.cyan} - 모델 변경                       ║
-║   ${c.green}/ollama-url <url>${c.cyan} - Ollama URL 설정                       ║
+║   ${c.green}/parallel${c.cyan} - 멀티 프로필 병렬 실행                         ║
+║   ${c.green}/profiles${c.cyan} - Chrome 프로필 목록                            ║
 ║   ${c.green}/config${c.cyan} - 현재 설정 확인                                  ║
 ║   ${c.green}exit${c.cyan} - 종료                                               ║
 ║                                                               ║
@@ -1162,6 +1479,65 @@ async function main() {
       continue;
     }
 
+    // /parallel 처리 - 병렬 브라우저 실행
+    if (arg === "/parallel") {
+      // 사용법 안내
+      console.log(`\n${c.cyan}병렬 브라우저 모드${c.reset}`);
+      console.log(`${c.dim}여러 프로필로 동시에 작업을 실행합니다.${c.reset}\n`);
+      console.log(`${c.yellow}사용법:${c.reset}`);
+      console.log(`  npm start '/parallel "Profile 1,Profile 2,Profile 3" "작업1" "작업2" "작업3"'`);
+      console.log(`\n${c.dim}프로필 목록은 쉼표로 구분합니다.${c.reset}`);
+      console.log(`${c.dim}작업 수 > 프로필 수인 경우 라운드 로빈으로 배분됩니다.${c.reset}\n`);
+
+      const profiles = getChromeProfiles();
+      console.log(`${c.cyan}사용 가능한 프로필:${c.reset}`);
+      for (const p of profiles) {
+        const dirName = path.basename(p.path);
+        console.log(`  ${c.yellow}${dirName}${c.reset} - ${p.name}`);
+      }
+      console.log();
+      process.exit(0);
+    }
+
+    // /parallel "profiles" "task1" "task2" ... 형식
+    if (arg.startsWith("/parallel ")) {
+      const parallelArgs = arg.slice(10).trim();
+      // 첫 번째 따옴표 그룹은 프로필 목록, 나머지는 작업
+      const matches = parallelArgs.match(/"[^"]+"/g);
+
+      if (!matches || matches.length < 2) {
+        console.log(`${c.red}사용법: /parallel "프로필1,프로필2" "작업1" "작업2"${c.reset}`);
+        process.exit(1);
+      }
+
+      const profileStr = matches[0].replace(/"/g, "");
+      const profiles = profileStr.split(",").map((p) => p.trim());
+      const tasks = matches.slice(1).map((t) => t.replace(/"/g, ""));
+
+      console.log(`${c.cyan}프로필: ${profiles.join(", ")}${c.reset}`);
+      console.log(`${c.cyan}작업 수: ${tasks.length}${c.reset}\n`);
+
+      try {
+        const model = resolveModel(config);
+        const isOllama = config.provider === "ollama";
+
+        const browsers = await startParallelBrowsers(profiles);
+
+        if (browsers.length === 0) {
+          console.log(`${c.red}실행 가능한 브라우저가 없습니다.${c.reset}`);
+          console.log(`${c.dim}해당 프로필을 사용 중인 Chrome을 종료하세요.${c.reset}`);
+          process.exit(1);
+        }
+
+        await runParallelAgents(browsers, tasks, model, isOllama);
+        await stopParallelBrowsers();
+      } catch (error) {
+        console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
+        await stopParallelBrowsers();
+      }
+      process.exit(0);
+    }
+
     // /set 처리
     if (arg.startsWith("/set ")) {
       const parts = arg.slice(5).split(" ");
@@ -1275,6 +1651,62 @@ async function main() {
       // 모델 목록
       if (trimmed === "/models") {
         printModels();
+        prompt();
+        return;
+      }
+
+      // 병렬 실행 도움말
+      if (trimmed === "/parallel") {
+        console.log(`\n${c.cyan}병렬 브라우저 모드${c.reset}`);
+        console.log(`${c.dim}여러 프로필로 동시에 작업을 실행합니다.${c.reset}\n`);
+        console.log(`${c.yellow}사용법:${c.reset}`);
+        console.log(`  /parallel "Profile 1,Profile 2" "작업1" "작업2"`);
+        console.log(`\n${c.dim}프로필 목록은 쉼표로 구분합니다.${c.reset}`);
+        console.log(`${c.dim}작업 수 > 프로필 수인 경우 라운드 로빈으로 배분됩니다.${c.reset}\n`);
+
+        const profiles = getChromeProfiles();
+        console.log(`${c.cyan}사용 가능한 프로필:${c.reset}`);
+        for (const p of profiles) {
+          const dirName = path.basename(p.path);
+          console.log(`  ${c.yellow}${dirName}${c.reset} - ${p.name}`);
+        }
+        console.log();
+        prompt();
+        return;
+      }
+
+      // 병렬 실행
+      if (trimmed.startsWith("/parallel ")) {
+        const parallelArgs = trimmed.slice(10).trim();
+        const matches = parallelArgs.match(/"[^"]+"/g);
+
+        if (!matches || matches.length < 2) {
+          console.log(`${c.red}사용법: /parallel "프로필1,프로필2" "작업1" "작업2"${c.reset}`);
+          prompt();
+          return;
+        }
+
+        const profileStr = matches[0].replace(/"/g, "");
+        const profiles = profileStr.split(",").map((p) => p.trim());
+        const tasks = matches.slice(1).map((t) => t.replace(/"/g, ""));
+
+        try {
+          const model = resolveModel(config);
+          const isOllama = config.provider === "ollama";
+
+          const browsers = await startParallelBrowsers(profiles);
+
+          if (browsers.length > 0) {
+            await runParallelAgents(browsers, tasks, model, isOllama);
+          } else {
+            console.log(`${c.red}실행 가능한 브라우저가 없습니다.${c.reset}`);
+          }
+
+          await stopParallelBrowsers();
+        } catch (error) {
+          console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
+          await stopParallelBrowsers();
+        }
         prompt();
         return;
       }
