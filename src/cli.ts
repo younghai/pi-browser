@@ -898,7 +898,7 @@ Be concise. Complete the full task autonomously.`,
     tools: browserTools,
   };
 
-  const maxTurns = 20;
+  const maxTurns = 100;
 
   for (let turn = 0; turn < maxTurns; turn++) {
     console.log(`${c.blue}[Turn ${turn + 1}/${maxTurns}]${c.reset}`);
