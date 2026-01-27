@@ -16,10 +16,12 @@
     "@mariozechner/pi-ai": "0.49.3",
     "@sinclair/typebox": "^0.34.41",
     "dotenv": "^17.2.3",
-    "playwright-core": "^1.50.0"
+    "playwright-core": "^1.50.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   },

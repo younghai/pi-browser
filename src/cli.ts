@@ -13,6 +13,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { WebSocketServer, WebSocket } from "ws";
 
 import { Type } from "@sinclair/typebox";
 import {
@@ -42,7 +43,94 @@ const c = {
 };
 
 // ============================================================
-// 브라우저 관리
+// 브라우저 모드 (CDP or Extension)
+// ============================================================
+type BrowserMode = "cdp" | "extension";
+let browserMode: BrowserMode = "cdp";
+
+// Extension 모드용 WebSocket
+let wss: WebSocketServer | null = null;
+let extClient: WebSocket | null = null;
+let messageId = 0;
+const pendingRequests = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+
+// Extension에 명령 전송
+function sendExtCommand(command: string, params: Record<string, unknown> = {}): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!extClient || extClient.readyState !== WebSocket.OPEN) {
+      reject(new Error("Extension이 연결되지 않았습니다. Chrome에서 Pi-Browser 확장 프로그램을 확인하세요."));
+      return;
+    }
+
+    const id = ++messageId;
+    pendingRequests.set(id, { resolve, reject });
+
+    extClient.send(JSON.stringify({ id, command, params }));
+
+    // 타임아웃
+    setTimeout(() => {
+      if (pendingRequests.has(id)) {
+        pendingRequests.delete(id);
+        reject(new Error(`명령 타임아웃: ${command}`));
+      }
+    }, 60000);
+  });
+}
+
+// WebSocket 서버 시작
+let extensionConnectedOnce = false;
+
+function startExtensionServer(): Promise<void> {
+  return new Promise((resolve) => {
+    wss = new WebSocketServer({ port: 9876 });
+
+    wss.on("connection", (ws) => {
+      if (!extensionConnectedOnce) {
+        console.log(`${c.green}✓ Extension 연결됨${c.reset}`);
+        extensionConnectedOnce = true;
+      }
+      extClient = ws;
+
+      ws.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          const pending = pendingRequests.get(msg.id);
+          if (pending) {
+            pendingRequests.delete(msg.id);
+            if (msg.error) {
+              pending.reject(new Error(msg.error));
+            } else {
+              pending.resolve(msg.result);
+            }
+          }
+        } catch (e) {
+          console.error("Extension 메시지 파싱 에러:", e);
+        }
+      });
+
+      ws.on("close", () => {
+        extClient = null;
+      });
+
+      resolve();
+    });
+
+    console.log(`${c.cyan}Extension 서버 시작됨 (ws://localhost:9876)${c.reset}`);
+    console.log(`${c.dim}Chrome에서 Pi-Browser 확장 프로그램이 자동으로 연결됩니다.${c.reset}\n`);
+  });
+}
+
+// Extension 서버 종료
+function stopExtensionServer() {
+  if (wss) {
+    wss.close();
+    wss = null;
+  }
+  extClient = null;
+}
+
+// ============================================================
+// 브라우저 관리 (CDP 모드)
 // ============================================================
 interface RunningChrome {
   process: ChildProcess;
@@ -75,6 +163,177 @@ function findChromeExecutable(): string | null {
   return null;
 }
 
+// Chrome 프로필 목록 가져오기
+function getChromeProfiles(): { name: string; path: string }[] {
+  const chromeDir = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+  const profiles: { name: string; path: string }[] = [];
+
+  if (!fs.existsSync(chromeDir)) return profiles;
+
+  const entries = fs.readdirSync(chromeDir);
+  for (const entry of entries) {
+    const profilePath = path.join(chromeDir, entry);
+    const prefsPath = path.join(profilePath, "Preferences");
+
+    if (fs.existsSync(prefsPath)) {
+      try {
+        const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+        const profileName = prefs?.profile?.name || entry;
+        profiles.push({ name: profileName, path: profilePath });
+      } catch {
+        profiles.push({ name: entry, path: profilePath });
+      }
+    }
+  }
+
+  return profiles;
+}
+
+// 선택된 프로필 저장
+let selectedProfile: string | null = null;
+
+// 프로필에서 쿠키/로그인 정보 복사
+async function importProfileData(sourceProfile: string): Promise<void> {
+  const chromeDir = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+  const sourcePath = path.join(chromeDir, sourceProfile);
+  const targetPath = path.join(os.homedir(), ".pi-browser", "chrome-profile", "Default");
+
+  // 소스 프로필 확인
+  if (!fs.existsSync(sourcePath)) {
+    console.log(`${c.red}프로필을 찾을 수 없습니다: ${sourceProfile}${c.reset}`);
+    process.exit(1);
+  }
+
+  // 타겟 디렉토리 생성
+  fs.mkdirSync(targetPath, { recursive: true });
+
+  // 복사할 파일들 (쿠키, 로컬 스토리지, 로그인 데이터 등)
+  const filesToCopy = [
+    "Cookies",
+    "Login Data",
+    "Login Data For Account",
+    "Web Data",
+  ];
+
+  const dirsToCopy = [
+    "Local Storage",
+    "Session Storage",
+    "IndexedDB",
+  ];
+
+  console.log(`${c.cyan}프로필 데이터 복사 중...${c.reset}`);
+  console.log(`${c.dim}소스: ${sourceProfile}${c.reset}`);
+  console.log(`${c.dim}대상: pi-browser 프로필${c.reset}\n`);
+
+  let copied = 0;
+
+  // 파일 복사
+  for (const file of filesToCopy) {
+    const src = path.join(sourcePath, file);
+    const dst = path.join(targetPath, file);
+    if (fs.existsSync(src)) {
+      try {
+        fs.copyFileSync(src, dst);
+        console.log(`  ${c.green}✓${c.reset} ${file}`);
+        copied++;
+      } catch (e) {
+        console.log(`  ${c.yellow}⚠${c.reset} ${file} (복사 실패 - 파일이 사용 중일 수 있음)`);
+      }
+    }
+  }
+
+  // 디렉토리 복사
+  for (const dir of dirsToCopy) {
+    const src = path.join(sourcePath, dir);
+    const dst = path.join(targetPath, dir);
+    if (fs.existsSync(src)) {
+      try {
+        fs.cpSync(src, dst, { recursive: true, force: true });
+        console.log(`  ${c.green}✓${c.reset} ${dir}/`);
+        copied++;
+      } catch (e) {
+        console.log(`  ${c.yellow}⚠${c.reset} ${dir}/ (복사 실패)`);
+      }
+    }
+  }
+
+  if (copied > 0) {
+    console.log(`\n${c.green}✓ 프로필 데이터가 복사되었습니다.${c.reset}`);
+    console.log(`${c.dim}이제 pi-browser에서 로그인 상태가 유지됩니다.${c.reset}\n`);
+  } else {
+    console.log(`\n${c.yellow}복사된 파일이 없습니다.${c.reset}\n`);
+  }
+}
+
+// Chrome을 특정 프로필로 CDP 포트와 함께 시작
+async function startChromeWithProfile(profileDir: string): Promise<void> {
+  const executablePath = findChromeExecutable();
+  if (!executablePath) {
+    console.log(`${c.red}Chrome을 찾을 수 없습니다.${c.reset}`);
+    process.exit(1);
+  }
+
+  // 이미 9222 포트에 Chrome이 실행 중인지 확인
+  try {
+    const res = await fetch("http://127.0.0.1:9222/json/version", { signal: AbortSignal.timeout(1000) });
+    if (res.ok) {
+      console.log(`${c.green}✓ 기존 Chrome에 연결됨 (포트 9222)${c.reset}`);
+      console.log(`${c.dim}이미 CDP 포트가 열린 Chrome이 실행 중입니다.${c.reset}\n`);
+      return;
+    }
+  } catch {}
+
+  const chromeDir = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+
+  // 프로필 존재 확인
+  const profilePath = path.join(chromeDir, profileDir);
+  if (!fs.existsSync(profilePath)) {
+    console.log(`${c.red}프로필을 찾을 수 없습니다: ${profileDir}${c.reset}`);
+    console.log(`${c.dim}/profiles 명령어로 사용 가능한 프로필을 확인하세요.${c.reset}\n`);
+    process.exit(1);
+  }
+
+  console.log(`${c.cyan}Chrome 시작 중... (프로필: ${profileDir})${c.reset}`);
+  console.log(`${c.yellow}⚠️  해당 프로필을 사용 중인 Chrome을 먼저 종료하세요!${c.reset}\n`);
+
+  const args = [
+    "--remote-debugging-port=9222",
+    `--user-data-dir=${chromeDir}`,
+    `--profile-directory=${profileDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+  ];
+
+  const proc = spawn(executablePath, args, {
+    detached: true,
+    stdio: "ignore",
+  });
+  proc.unref();
+
+  // CDP 준비 대기
+  console.log(`${c.dim}CDP 연결 대기 중...${c.reset}`);
+  let connected = false;
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch("http://127.0.0.1:9222/json/version", { signal: AbortSignal.timeout(500) });
+      if (res.ok) {
+        connected = true;
+        break;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  if (connected) {
+    console.log(`${c.green}✓ Chrome이 CDP 포트 9222로 시작되었습니다.${c.reset}`);
+    console.log(`${c.dim}이제 pi-browser가 이 Chrome에 자동으로 연결됩니다.${c.reset}\n`);
+  } else {
+    console.log(`${c.red}Chrome CDP 연결에 실패했습니다.${c.reset}`);
+    console.log(`${c.dim}해당 프로필이 다른 Chrome에서 사용 중일 수 있습니다.${c.reset}\n`);
+    process.exit(1);
+  }
+}
+
 async function startBrowser(): Promise<void> {
   if (browser) return;
 
@@ -93,18 +352,32 @@ async function startBrowser(): Promise<void> {
     // 기존 브라우저 없음 - 새로 실행
   }
 
-  // 2. 새 브라우저 실행 (사용자 프로필 폴더 사용 - 로그인 유지)
+  // 2. 새 브라우저 실행
   const executablePath = findChromeExecutable();
   if (!executablePath) throw new Error("Chrome not found");
 
   const cdpPort = 9444;
-  // 사용자 홈 폴더에 프로필 저장 (로그인 정보 유지)
-  const userDataDir = path.join(os.homedir(), ".pi-browser", "chrome-profile");
-  fs.mkdirSync(userDataDir, { recursive: true });
+
+  // 프로필 경로 결정
+  let userDataDir: string;
+  let profileDir: string | undefined;
+
+  if (selectedProfile) {
+    // 사용자가 선택한 Chrome 프로필 사용
+    const chromeDir = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+    userDataDir = chromeDir;
+    profileDir = selectedProfile;
+    console.log(`${c.cyan}프로필: ${selectedProfile}${c.reset}`);
+  } else {
+    // 기본 pi-browser 프로필 사용
+    userDataDir = path.join(os.homedir(), ".pi-browser", "chrome-profile");
+    fs.mkdirSync(userDataDir, { recursive: true });
+  }
 
   const args = [
     `--remote-debugging-port=${cdpPort}`,
     `--user-data-dir=${userDataDir}`,
+    ...(profileDir ? [`--profile-directory=${profileDir}`] : []),
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-sync",
@@ -119,12 +392,29 @@ async function startBrowser(): Promise<void> {
   const cdpUrl = `http://127.0.0.1:${cdpPort}`;
 
   // CDP 준비 대기
+  let cdpReady = false;
   for (let i = 0; i < 50; i++) {
     try {
       const res = await fetch(`${cdpUrl}/json/version`, { signal: AbortSignal.timeout(500) });
-      if (res.ok) break;
+      if (res.ok) {
+        cdpReady = true;
+        break;
+      }
     } catch {}
     await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (!cdpReady) {
+    // 프로세스가 살아있는지 확인
+    if (proc.exitCode !== null || proc.killed) {
+      throw new Error(
+        selectedProfile
+          ? `Chrome을 실행할 수 없습니다. '${selectedProfile}' 프로필이 다른 Chrome에서 사용 중일 수 있습니다.\n` +
+            `해결방법: 해당 프로필을 사용하는 Chrome을 모두 종료하세요.`
+          : "Chrome을 실행할 수 없습니다."
+      );
+    }
+    throw new Error(`Chrome CDP 연결 시간 초과 (포트 ${cdpPort})`);
   }
 
   console.log(`${c.yellow}✓ 새 브라우저 실행됨${c.reset}`);
@@ -235,12 +525,105 @@ const browserTools: Tool[] = [
 ];
 
 // ============================================================
-// 브라우저 도구 실행
+// Extension 모드 도구 실행
+// ============================================================
+async function executeExtensionTool(
+  name: string,
+  args: Record<string, unknown>
+): Promise<{ text: string; image?: { data: string; mimeType: string } }> {
+  switch (name) {
+    case "browser_navigate": {
+      const result = await sendExtCommand("navigate", { url: args.url });
+      return { text: `Navigated to ${result.url}. Title: ${result.title}` };
+    }
+
+    case "browser_click": {
+      const selector = args.selector as string;
+      await sendExtCommand("click", { selector });
+      return { text: `Clicked: ${selector}` };
+    }
+
+    case "browser_fill": {
+      const selector = args.selector as string;
+      const text = args.text as string;
+      await sendExtCommand("fill", { selector, value: text });
+      return { text: `Filled "${text}" into ${selector}` };
+    }
+
+    case "browser_press": {
+      await sendExtCommand("press", { key: args.key });
+      return { text: `Pressed: ${args.key}` };
+    }
+
+    case "browser_screenshot": {
+      const result = await sendExtCommand("screenshot", {});
+      // Extension에서 data URL 형식으로 반환
+      const dataUrl = result.image as string;
+      const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, "");
+      return {
+        text: "Screenshot captured",
+        image: {
+          data: base64,
+          mimeType: "image/png",
+        },
+      };
+    }
+
+    case "browser_snapshot": {
+      const result = await sendExtCommand("snapshot", {});
+      const elements = result.elements as Array<{
+        ref: string;
+        tag: string;
+        text: string;
+        selector: string;
+      }>;
+
+      const lines = elements
+        .slice(0, 20)
+        .map((el, i) => `[e${i + 1}] ${el.tag} "${el.text.slice(0, 50)}" → ${el.selector}`);
+
+      return { text: `Page elements:\n${lines.join("\n")}` };
+    }
+
+    case "browser_scroll": {
+      const direction = (args.direction as string) || "down";
+      await sendExtCommand("scroll", { direction, amount: 500 });
+      return { text: `Scrolled ${direction}` };
+    }
+
+    case "browser_get_text": {
+      const result = await sendExtCommand("getText", {});
+      const text = (result.text as string).slice(0, 5000);
+      return { text: `Page text:\n${text}` };
+    }
+
+    case "browser_wait": {
+      const timeMs = args.timeMs as number | undefined;
+      if (timeMs) {
+        await new Promise((r) => setTimeout(r, timeMs));
+        return { text: `Waited ${timeMs}ms` };
+      }
+      return { text: "Waited" };
+    }
+
+    default:
+      return { text: `Unknown tool: ${name}` };
+  }
+}
+
+// ============================================================
+// 브라우저 도구 실행 (CDP 모드)
 // ============================================================
 async function executeBrowserTool(
   name: string,
   args: Record<string, unknown>
 ): Promise<{ text: string; image?: { data: string; mimeType: string } }> {
+  // Extension 모드
+  if (browserMode === "extension") {
+    return executeExtensionTool(name, args);
+  }
+
+  // CDP 모드
   if (!browser) {
     await startBrowser();
   }
@@ -427,6 +810,7 @@ interface Config {
   provider: string;
   model: string;
   ollamaUrl?: string;
+  chromeProfile?: string; // 사용자 Chrome 프로필 경로
 }
 
 const CONFIG_PATH = path.join(os.homedir(), ".pi-browser.json");
@@ -681,14 +1065,73 @@ async function main() {
   const config = loadConfig();
 
   // 커맨드 라인 인자 처리
-  const args = process.argv.slice(2);
-  if (args.length > 0) {
-    const arg = args.join(" ");
+  const rawArgs = process.argv.slice(2);
+  let mission: string | null = null;
 
-    // 명령어 처리
+  // --ext 또는 /ext 옵션 확인
+  const extIndex = rawArgs.findIndex((a) => a === "--ext" || a === "/ext");
+  if (extIndex !== -1) {
+    browserMode = "extension";
+    rawArgs.splice(extIndex, 1);
+  }
+
+  // 인자 파싱: /profile과 미션을 분리
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+
+    // Extension 모드 시작
+    if (arg === "/ext") {
+      browserMode = "extension";
+      continue;
+    }
+
     if (arg === "/models") {
       printModels();
       process.exit(0);
+    }
+
+    if (arg === "/profiles") {
+      const profiles = getChromeProfiles();
+      console.log(`\n${c.cyan}사용 가능한 Chrome 프로필:${c.reset}\n`);
+      if (profiles.length === 0) {
+        console.log(`  ${c.dim}프로필을 찾을 수 없습니다.${c.reset}`);
+      } else {
+        for (const p of profiles) {
+          const dirName = path.basename(p.path);
+          console.log(`  ${c.yellow}${dirName}${c.reset} - ${p.name}`);
+        }
+      }
+      console.log(`\n${c.dim}사용법:${c.reset}`);
+      console.log(`${c.dim}  /import <프로필> - 프로필의 로그인 정보를 pi-browser로 복사${c.reset}`);
+      console.log(`${c.dim}  /connect <프로필> - 프로필로 Chrome을 CDP 포트와 함께 시작${c.reset}`);
+      console.log(`${c.dim}예: /import "Profile 14"${c.reset}\n`);
+      process.exit(0);
+    }
+
+    // /connect <profile> - Chrome을 CDP 포트로 시작하고 연결
+    if (arg === "/connect" && i + 1 < rawArgs.length) {
+      const profileName = rawArgs[i + 1];
+      await startChromeWithProfile(profileName);
+      i++;
+      continue;
+    }
+    if (arg.startsWith("/connect ")) {
+      const profileName = arg.slice(9).trim();
+      await startChromeWithProfile(profileName);
+      continue;
+    }
+
+    // /import <profile> - 프로필의 쿠키/로그인 정보 복사
+    if (arg === "/import" && i + 1 < rawArgs.length) {
+      const profileName = rawArgs[i + 1];
+      await importProfileData(profileName);
+      i++;
+      continue;
+    }
+    if (arg.startsWith("/import ")) {
+      const profileName = arg.slice(8).trim();
+      await importProfileData(profileName);
+      continue;
     }
 
     if (arg === "/config") {
@@ -702,13 +1145,30 @@ async function main() {
       process.exit(0);
     }
 
+    // /profile 처리 (다음 인자가 프로필 이름)
+    if (arg === "/profile" && i + 1 < rawArgs.length) {
+      selectedProfile = rawArgs[i + 1];
+      console.log(`${c.green}프로필 선택됨: ${selectedProfile}${c.reset}`);
+      console.log(`${c.dim}주의: 해당 프로필을 사용 중인 Chrome을 먼저 종료하세요!${c.reset}\n`);
+      i++; // 프로필 이름 건너뛰기
+      continue;
+    }
+
+    // /profile <name> 형식 (공백 포함된 단일 인자)
+    if (arg.startsWith("/profile ")) {
+      selectedProfile = arg.slice(9).trim();
+      console.log(`${c.green}프로필 선택됨: ${selectedProfile}${c.reset}`);
+      console.log(`${c.dim}주의: 해당 프로필을 사용 중인 Chrome을 먼저 종료하세요!${c.reset}\n`);
+      continue;
+    }
+
+    // /set 처리
     if (arg.startsWith("/set ")) {
       const parts = arg.slice(5).split(" ");
       if (parts.length >= 2) {
         const [provider, ...modelParts] = parts;
         const model = modelParts.join(" ");
 
-        // Ollama는 유효성 검사 없이 설정
         if (provider === "ollama") {
           config.provider = provider;
           config.model = model;
@@ -728,13 +1188,11 @@ async function main() {
         }
       } else {
         console.log(`${c.yellow}사용법: /set <provider> <model>${c.reset}`);
-        console.log(`${c.dim}예: /set ollama llama3.2${c.reset}`);
-        console.log(`${c.dim}예: /set google gemini-2.5-flash${c.reset}\n`);
       }
       process.exit(0);
     }
 
-    // Ollama URL 설정
+    // /ollama-url 처리
     if (arg.startsWith("/ollama-url ")) {
       const url = arg.slice(12).trim();
       config.ollamaUrl = url;
@@ -743,18 +1201,50 @@ async function main() {
       process.exit(0);
     }
 
-    // 미션 실행
+    // 일반 인자는 미션으로 처리
     if (!arg.startsWith("/")) {
-      try {
-        const model = resolveModel(config);
-        const isOllama = config.provider === "ollama";
-        await runAgent(arg, model, isOllama);
-      } catch (error) {
-        console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
-      }
-      await stopBrowser();
-      process.exit(0);
+      mission = arg;
     }
+  }
+
+  // Extension 모드일 때 서버 시작
+  if (browserMode === "extension") {
+    console.log(`\n${c.cyan}🔌 Extension 모드${c.reset}`);
+    await startExtensionServer();
+
+    // Extension 연결 대기
+    console.log(`${c.dim}Extension 연결 대기 중... (Chrome에서 Pi-Browser 확장 프로그램 확인)${c.reset}`);
+
+    // 최대 60초 대기
+    for (let i = 0; i < 120; i++) {
+      if (extClient) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    if (!extClient) {
+      console.log(`${c.red}Extension 연결 타임아웃${c.reset}`);
+      console.log(`${c.dim}Chrome에서 Pi-Browser 확장 프로그램을 설치하고 활성화하세요.${c.reset}`);
+      console.log(`${c.dim}확장 프로그램 위치: ${path.join(process.cwd(), "extension")}${c.reset}\n`);
+      stopExtensionServer();
+      process.exit(1);
+    }
+  }
+
+  // 미션이 있으면 실행
+  if (mission) {
+    try {
+      const model = resolveModel(config);
+      const isOllama = config.provider === "ollama";
+      await runAgent(mission, model, isOllama);
+    } catch (error) {
+      console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
+    }
+    if (browserMode === "extension") {
+      stopExtensionServer();
+    } else {
+      await stopBrowser();
+    }
+    process.exit(0);
   }
 
   printBanner(config);
