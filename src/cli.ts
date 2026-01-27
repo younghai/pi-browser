@@ -355,7 +355,7 @@ function resolveModel(config: Config): Model {
 // ============================================================
 // 에이전트 루프
 // ============================================================
-async function runAgent(mission: string, model: Model): Promise<void> {
+async function runAgent(mission: string, model: Model, isOllama: boolean = false): Promise<void> {
   console.log(`\n${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}`);
   console.log(`${c.bright}🎯 미션: ${mission}${c.reset}`);
   console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}\n`);
@@ -395,7 +395,8 @@ Be concise in your responses.`,
 
     try {
       // 스트리밍으로 응답 받기
-      const s = streamSimple(model, ctx);
+      const streamOptions = isOllama ? { apiKey: "ollama" } : undefined;
+      const s = streamSimple(model, ctx, streamOptions);
       let textBuffer = "";
 
       process.stdout.write(`${c.magenta}AI: ${c.reset}`);
@@ -618,7 +619,8 @@ async function main() {
     if (!arg.startsWith("/")) {
       try {
         const model = resolveModel(config);
-        await runAgent(arg, model);
+        const isOllama = config.provider === "ollama";
+        await runAgent(arg, model, isOllama);
       } catch (error) {
         console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
       }
@@ -724,7 +726,8 @@ async function main() {
       // 미션 실행
       try {
         const model = resolveModel(config);
-        await runAgent(trimmed, model);
+        const isOllama = config.provider === "ollama";
+        await runAgent(trimmed, model, isOllama);
       } catch (error) {
         console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
       }
