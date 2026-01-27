@@ -93,12 +93,13 @@ async function startBrowser(): Promise<void> {
     // 기존 브라우저 없음 - 새로 실행
   }
 
-  // 2. 새 브라우저 실행
+  // 2. 새 브라우저 실행 (사용자 프로필 폴더 사용 - 로그인 유지)
   const executablePath = findChromeExecutable();
   if (!executablePath) throw new Error("Chrome not found");
 
   const cdpPort = 9444;
-  const userDataDir = path.join(os.tmpdir(), `pi-browser-${Date.now()}`);
+  // 사용자 홈 폴더에 프로필 저장 (로그인 정보 유지)
+  const userDataDir = path.join(os.homedir(), ".pi-browser", "chrome-profile");
   fs.mkdirSync(userDataDir, { recursive: true });
 
   const args = [
