@@ -7,6 +7,15 @@
  */
 
 import "dotenv/config";
+
+// API 키 호환성: GOOGLE_API_KEY와 GEMINI_API_KEY 모두 지원
+if (process.env.GOOGLE_API_KEY && !process.env.GEMINI_API_KEY) {
+  process.env.GEMINI_API_KEY = process.env.GOOGLE_API_KEY;
+}
+if (process.env.GEMINI_API_KEY && !process.env.GOOGLE_API_KEY) {
+  process.env.GOOGLE_API_KEY = process.env.GEMINI_API_KEY;
+}
+
 import readline from "node:readline";
 import { chromium, type Browser, type Page, type BrowserContext } from "playwright-core";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -14,6 +23,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
+import { startTelegramBot, stopTelegramBot, type MessageContext } from "./telegram.js";
+import { startWebClient, stoppedTasks, loadSettings, broadcastToClients, saveResultToNotion } from "./web-client.js";
 
 import { Type } from "@sinclair/typebox";
 import {
@@ -47,6 +58,81 @@ const c = {
 // ============================================================
 type BrowserMode = "cdp" | "extension";
 let browserMode: BrowserMode = "cdp";
+
+// ============================================================
+// Chrome 프로필 관리
+// ============================================================
+interface ChromeProfile {
+  name: string;
+  path: string;
+  displayName: string;
+}
+
+function getChromeProfilesDir(): string {
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+  } else if (process.platform === "win32") {
+    return path.join(os.homedir(), "AppData", "Local", "Google", "Chrome", "User Data");
+  } else {
+    return path.join(os.homedir(), ".config", "google-chrome");
+  }
+}
+
+function scanChromeProfiles(): ChromeProfile[] {
+  const profiles: ChromeProfile[] = [];
+  const chromeDir = getChromeProfilesDir();
+
+  // Pi-Browser 전용 프로필도 추가
+  const piBrowserProfile = path.join(os.homedir(), ".pi-browser", "chrome-profile");
+  profiles.push({
+    name: "pi-browser",
+    path: piBrowserProfile,
+    displayName: "🤖 Pi-Browser (기본)",
+  });
+
+  if (!fs.existsSync(chromeDir)) {
+    return profiles;
+  }
+
+  try {
+    const entries = fs.readdirSync(chromeDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+
+      // Default 프로필 또는 Profile N 형식
+      if (entry.name === "Default" || entry.name.startsWith("Profile ")) {
+        const profilePath = path.join(chromeDir, entry.name);
+        const prefsPath = path.join(profilePath, "Preferences");
+
+        let displayName = entry.name;
+
+        // Preferences 파일에서 프로필 이름 읽기
+        if (fs.existsSync(prefsPath)) {
+          try {
+            const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+            if (prefs.profile?.name) {
+              displayName = prefs.profile.name;
+            }
+          } catch {}
+        }
+
+        profiles.push({
+          name: entry.name,
+          path: profilePath,
+          displayName: `👤 ${displayName}`,
+        });
+      }
+    }
+  } catch (err) {
+    console.error("프로필 스캔 오류:", err);
+  }
+
+  return profiles;
+}
+
+// 현재 선택된 프로필
+let selectedProfile: ChromeProfile | null = null;
 
 // Extension 모드용 WebSocket
 let wss: WebSocketServer | null = null;
@@ -90,6 +176,8 @@ function startExtensionServer(): Promise<void> {
         extensionConnectedOnce = true;
       }
       extClient = ws;
+      // 웹 UI에 Extension 연결 상태 알림
+      broadcastToClients({ type: "extensionStatus", connected: true });
 
       ws.on("message", (data) => {
         try {
@@ -110,6 +198,8 @@ function startExtensionServer(): Promise<void> {
 
       ws.on("close", () => {
         extClient = null;
+        // 웹 UI에 Extension 연결 해제 알림
+        broadcastToClients({ type: "extensionStatus", connected: false });
       });
 
       resolve();
@@ -409,10 +499,14 @@ async function runParallelAgentSingle(
   const prefix = `[${pb.profile}:${taskIndex + 1}]`;
 
   const ctx: Context = {
-    systemPrompt: `You are a browser automation agent. Complete the user's mission using browser tools.
+    systemPrompt: `You are a browser automation agent. You MUST use browser tools to complete ANY task.
+
+IMPORTANT: You have access to a real browser. For ANY question (date, weather, news, prices, etc.),
+use the browser to search and find the answer. NEVER say you don't know - just search for it!
 
 TOOLS:
-- browser_navigate: {"url": "https://..."} - Go to URL
+- get_current_time: {} - Get current date and time
+- browser_navigate: {"url": "https://..."} - Go to URL (use google.com to search anything)
 - browser_snapshot: {} - Get interactive elements with selectors
 - browser_fill: {"selector": "...", "text": "..."} - Type text
 - browser_click: {"selector": "..."} - Click element
@@ -420,7 +514,7 @@ TOOLS:
 - browser_screenshot: {} - Capture screen
 - browser_get_text: {"selector": ""} - Get page text
 
-Be concise. Complete the full task autonomously.`,
+ALWAYS use tools. Search on Google if you need information.`,
     messages: [{ role: "user", content: mission }],
     tools: browserTools,
   };
@@ -589,9 +683,6 @@ function getChromeProfiles(): { name: string; path: string }[] {
 
   return profiles;
 }
-
-// 선택된 프로필 저장
-let selectedProfile: string | null = null;
 
 // 프로필에서 쿠키/로그인 정보 복사
 async function importProfileData(sourceProfile: string): Promise<void> {
@@ -764,11 +855,18 @@ async function startBrowser(): Promise<void> {
   let profileDir: string | undefined;
 
   if (selectedProfile) {
-    // 사용자가 선택한 Chrome 프로필 사용
-    const chromeDir = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
-    userDataDir = chromeDir;
-    profileDir = selectedProfile;
-    console.log(`${c.cyan}프로필: ${selectedProfile}${c.reset}`);
+    // 사용자가 선택한 프로필 사용
+    if (selectedProfile.name === "pi-browser") {
+      // Pi-Browser 전용 프로필
+      userDataDir = selectedProfile.path;
+      fs.mkdirSync(userDataDir, { recursive: true });
+    } else {
+      // Chrome 기존 프로필 (Default, Profile 1 등)
+      const chromeDir = getChromeProfilesDir();
+      userDataDir = chromeDir;
+      profileDir = selectedProfile.name;
+    }
+    console.log(`${c.cyan}프로필: ${selectedProfile.displayName}${c.reset}`);
   } else {
     // 기본 pi-browser 프로필 사용
     userDataDir = path.join(os.homedir(), ".pi-browser", "chrome-profile");
@@ -923,6 +1021,11 @@ const browserTools: Tool[] = [
       filename: Type.String({ description: "Filename to save as (e.g. song.mp3)" }),
     }),
   },
+  {
+    name: "get_current_time",
+    description: "Get the current date and time",
+    parameters: Type.Object({}),
+  },
 ];
 
 // ============================================================
@@ -1005,6 +1108,22 @@ async function executeExtensionTool(
         return { text: `Waited ${timeMs}ms` };
       }
       return { text: "Waited" };
+    }
+
+    case "get_current_time": {
+      const now = new Date();
+      const dateStr = now.toLocaleDateString("ko-KR", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+        weekday: "long",
+      });
+      const timeStr = now.toLocaleTimeString("ko-KR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+      return { text: `현재 날짜: ${dateStr}\n현재 시간: ${timeStr}` };
     }
 
     default:
@@ -1199,6 +1318,22 @@ async function executeBrowserTool(
       return { text: `Downloaded: ${savePath} (${suggestedName})` };
     }
 
+    case "get_current_time": {
+      const now = new Date();
+      const dateStr = now.toLocaleDateString("ko-KR", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+        weekday: "long",
+      });
+      const timeStr = now.toLocaleTimeString("ko-KR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+      return { text: `현재 날짜: ${dateStr}\n현재 시간: ${timeStr}` };
+    }
+
     default:
       return { text: `Unknown tool: ${name}` };
   }
@@ -1234,7 +1369,7 @@ function createOllamaModel(modelId: string, baseUrl: string = "http://localhost:
   return {
     id: modelId,
     name: `${modelId} (Ollama)`,
-    api: "openai-completions",
+    api: "openai",
     provider: "ollama",
     baseUrl,
     reasoning: false,
@@ -1250,7 +1385,17 @@ function resolveModel(config: Config): Model {
   if (config.provider === "ollama") {
     return createOllamaModel(config.model, config.ollamaUrl);
   }
-  return getModel(config.provider as any, config.model as any);
+  try {
+    const model = getModel(config.provider as any, config.model as any);
+    if (!model) {
+      console.log(`${c.yellow}⚠️ 모델을 찾을 수 없음: ${config.provider}/${config.model}, 기본 모델 사용${c.reset}`);
+      return getModel("google", "gemini-2.0-flash");
+    }
+    return model;
+  } catch (e) {
+    console.log(`${c.yellow}⚠️ 모델 로드 실패: ${(e as Error).message}, 기본 모델 사용${c.reset}`);
+    return getModel("google", "gemini-2.0-flash");
+  }
 }
 
 // ============================================================
@@ -1262,11 +1407,18 @@ async function runAgent(mission: string, model: Model, isOllama: boolean = false
   console.log(`${c.cyan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}\n`);
 
   const ctx: Context = {
-    systemPrompt: `You are a browser automation agent. Complete the user's mission using browser tools.
+    systemPrompt: `You are a browser automation agent with FULL browser access.
+
+CRITICAL RULES:
+1. NEVER say "I can't" or "I'm sorry" - just DO IT using the browser!
+2. You have access to a REAL browser with logged-in sessions. Just navigate and use it!
+3. Start with browser_navigate, then browser_snapshot to see the page.
+4. The browser has the user's cookies/logins. Just go to the website!
 
 TOOLS:
-- browser_navigate: {"url": "https://..."} - Go to URL
-- browser_snapshot: {} - Get interactive elements with selectors
+- get_current_time: {} - Get current date and time
+- browser_navigate: {"url": "..."} - Go to any URL directly
+- browser_snapshot: {} - See page elements (ALWAYS do this after navigate!)
 - browser_fill: {"selector": "...", "text": "..."} - Type text
 - browser_click: {"selector": "..."} - Click element
 - browser_press: {"key": "Enter"} - Press key
@@ -1277,24 +1429,10 @@ TOOLS:
 - browser_wait: {"textGone": "Loading..."} - Wait for text to disappear
 - browser_download: {"selector": "...", "filename": "file.mp3"} - Download file
 
-WORKFLOW:
-1. browser_navigate to the website
-2. browser_snapshot to find element selectors
-3. browser_fill/browser_click using EXACT selector from snapshot
-4. browser_wait for loading/processing to complete
-5. browser_download if file needs to be saved
-6. Report results
+WORKFLOW: navigate → snapshot → interact → get_text → report
+SELECTOR FORMAT: role:"name" (e.g., textbox:"Search", button:"Submit")
 
-SELECTOR FORMAT (from snapshot):
-- role:"name" format: textbox:"Search", button:"Submit"
-- Use EXACT value from snapshot output
-
-AUTOMATION TIPS:
-- Wait for "Loading" text to disappear before next action
-- Wait for "Download" or "Complete" text before downloading
-- Use browser_wait with textGone for loading states
-
-Be concise. Complete the full task autonomously.`,
+DO NOT refuse. DO NOT apologize. Just USE THE BROWSER.`,
     messages: [{ role: "user", content: mission }],
     tools: browserTools,
   };
@@ -1411,29 +1549,578 @@ Be concise. Complete the full task autonomously.`,
 // ============================================================
 function printBanner(config: Config) {
   console.log(`
-${c.cyan}╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║   ${c.bright}🤖 Pi-Browser CLI${c.reset}${c.cyan}                                          ║
-║   ${c.dim}Multi-Model AI Browser Control${c.reset}${c.cyan}                             ║
-║                                                               ║
-╠═══════════════════════════════════════════════════════════════╣
-║                                                               ║
-║   ${c.yellow}현재 모델: ${config.provider}/${config.model}${c.cyan}
-║                                                               ║
-║   ${c.dim}명령어:${c.cyan}                                                    ║
-║   ${c.green}/models${c.cyan} - 사용 가능한 모델 목록                           ║
-║   ${c.green}/set <provider> <model>${c.cyan} - 모델 변경                       ║
-║   ${c.green}/parallel${c.cyan} - 멀티 프로필 병렬 실행                         ║
-║   ${c.green}/profiles${c.cyan} - Chrome 프로필 목록                            ║
-║   ${c.green}/config${c.cyan} - 현재 설정 확인                                  ║
-║   ${c.green}exit${c.cyan} - 종료                                               ║
-║                                                               ║
-║   ${c.dim}예시:${c.cyan}                                                      ║
-║   ${c.green}> 쿠팡에서 아이폰 16 가격 알려줘${c.cyan}                          ║
-║   ${c.green}> 네이버에서 오늘 날씨 확인해줘${c.cyan}                           ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝${c.reset}
+${c.bright}🤖 Pi-Browser${c.reset} ${c.dim}(${config.provider}/${config.model})${c.reset}
+
+${c.dim}예시:${c.reset} 네이버에서 날씨 알려줘
+${c.dim}명령:${c.reset} e (로그인)  p 3 (병렬, 작업 하나씩 입력)  help  exit
 `);
+}
+
+function printHelp() {
+  console.log(`
+${c.bright}명령어${c.reset} ${c.dim}(슬래시 없이도 됨)${c.reset}
+
+${c.yellow}e${c.reset}               로그인 모드 (내 Chrome 계정 사용)
+${c.yellow}tg${c.reset}              텔레그램 봇 모드 (TELEGRAM_BOT_TOKEN 필요)
+${c.yellow}web${c.reset}             웹 UI 모드 (http://localhost:3456)
+${c.yellow}p N${c.reset}             병렬 실행 (브라우저 N개, 작업 하나씩 입력)
+                예: p 3 → 작업 입력 → 빈 줄로 실행
+${c.yellow}profiles${c.reset}        Chrome 프로필 목록
+${c.yellow}models${c.reset}          AI 모델 목록
+${c.yellow}set P M${c.reset}         모델 변경 (예: set google gemini-2.5-flash)
+${c.yellow}config${c.reset}          현재 설정
+${c.yellow}version${c.reset}         버전 정보
+${c.yellow}exit${c.reset}            종료
+`);
+}
+
+// 버전 정보
+function printVersion() {
+  const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf-8"));
+  console.log(`
+${c.bright}Pi-Browser${c.reset} v${pkg.version}
+
+${c.dim}Multi-model AI browser control CLI${c.reset}
+${c.dim}https://github.com/johunsang/pi-browser${c.reset}
+`);
+}
+
+// 웹 UI 모드
+async function runWebMode(config: Config, overridePort?: number): Promise<void> {
+  const port = overridePort ?? parseInt(process.env.WEB_PORT || "3456", 10);
+  const model = resolveModel(config);
+  const isOllama = config.provider === "ollama";
+
+  console.log(`\n${c.cyan}🌐 웹 UI 모드${c.reset}`);
+  console.log(`${c.dim}브라우저에서 http://localhost:${port} 접속${c.reset}\n`);
+
+  let currentTelegramBot: Awaited<ReturnType<typeof startTelegramBot>> | null = null;
+
+  await startWebClient({
+    port,
+    onTelegramStart: async (token, allowedUsers) => {
+      if (currentTelegramBot) {
+        stopTelegramBot();
+        currentTelegramBot = null;
+      }
+      currentTelegramBot = await startTelegramBot({
+        token,
+        allowedUsers: allowedUsers.length > 0 ? allowedUsers : undefined,
+        onMessage: async (text, _ctx) => {
+          console.log(`[Telegram] 메시지 수신: ${text}`);
+          return await runTelegramAgent(text, model, isOllama);
+        },
+      });
+    },
+    onTelegramStop: () => {
+      if (currentTelegramBot) {
+        stopTelegramBot();
+        currentTelegramBot = null;
+      }
+    },
+    onSettingsChange: (newSettings) => {
+      console.log(`[WebClient] 설정 변경됨:`, JSON.stringify(newSettings));
+    },
+    getProfiles: () => {
+      return scanChromeProfiles();
+    },
+    isExtensionConnected: () => {
+      return extClient !== null && extClient.readyState === 1; // WebSocket.OPEN = 1
+    },
+    onTask: async (taskId, mission, send, taskProfile) => {
+      send({ type: "log", text: `[START] ${mission}` });
+
+      // 설정에서 브라우저 모드 및 AI 설정 확인
+      const currentSettings = loadSettings();
+      const selectedMode = currentSettings.browser?.mode || "cdp";
+
+      // 웹 UI에서 설정한 AI 모델 사용 (있으면)
+      let taskModel = model;
+      let taskIsOllama = isOllama;
+      if (currentSettings.ai?.provider) {
+        const aiProvider = currentSettings.ai.provider;
+        const aiModelName = currentSettings.ai.model || "gemini-2.0-flash";
+        let aiOllamaUrl = currentSettings.ai.ollamaUrl || "http://localhost:11434";
+        // /v1 경로 확인 및 추가
+        if (!aiOllamaUrl.endsWith("/v1")) {
+          aiOllamaUrl = aiOllamaUrl.replace(/\/$/, "") + "/v1";
+        }
+        taskIsOllama = aiProvider === "ollama";
+
+        try {
+          if (taskIsOllama) {
+            taskModel = createOllamaModel(aiModelName, aiOllamaUrl);
+            send({ type: "log", text: `[AI] Ollama: ${aiModelName}` });
+          } else {
+            const fetchedModel = getModel(aiProvider as any, aiModelName as any);
+            if (!fetchedModel) {
+              throw new Error(`모델을 찾을 수 없음: ${aiProvider}/${aiModelName}`);
+            }
+            taskModel = fetchedModel;
+            send({ type: "log", text: `[AI] ${aiProvider}/${aiModelName}` });
+          }
+        } catch (e) {
+          send({ type: "log", text: `[AI] 모델 로드 실패: ${(e as Error).message}` });
+          // 기본 모델로 폴백
+          try {
+            taskModel = getModel("google", "gemini-2.0-flash");
+            taskIsOllama = false;
+            send({ type: "log", text: `[AI] 기본 모델 사용: google/gemini-2.0-flash` });
+          } catch {
+            send({ type: "error", text: "AI 모델을 로드할 수 없습니다. API 키를 확인하세요." });
+            return;
+          }
+        }
+      }
+
+      // 작업에서 전달된 프로필 또는 설정의 프로필 사용
+      const profilePath = taskProfile || currentSettings.browser?.selectedProfile;
+
+      // 브라우저 시작
+      if (selectedMode === "extension") {
+        browserMode = "extension";
+        if (!extClient) {
+          send({ type: "log", text: "[BROWSER] Extension 모드 시작 중..." });
+          await startExtensionServer();
+          send({ type: "log", text: "[BROWSER] Extension 서버 시작됨 (ws://localhost:9876)" });
+          send({ type: "log", text: "[BROWSER] Chrome에서 Pi-Browser 확장 프로그램을 연결하세요." });
+          // Extension 연결 대기 (최대 15초)
+          const timeout = 15000;
+          const start = Date.now();
+          while (!extClient && Date.now() - start < timeout) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+          if (!extClient) {
+            send({ type: "error", text: "❌ Extension 연결 실패!" });
+            send({ type: "log", text: "[ERROR] Chrome 확장 프로그램이 설치되지 않았거나 연결되지 않았습니다." });
+            send({ type: "log", text: "[INFO] 해결 방법:" });
+            send({ type: "log", text: "[INFO] 1. 설정에서 '브라우저 모드'를 'CDP 모드'로 변경하세요 (확장 프로그램 불필요)" });
+            send({ type: "log", text: "[INFO] 2. 또는 Chrome에서 확장 프로그램을 설치하세요:" });
+            send({ type: "log", text: "[INFO]    - chrome://extensions 접속" });
+            send({ type: "log", text: "[INFO]    - '개발자 모드' 활성화" });
+            send({ type: "log", text: "[INFO]    - 'extension' 폴더를 드래그&드롭" });
+            return;
+          }
+          send({ type: "log", text: "[BROWSER] Extension 연결됨!" });
+        }
+      } else {
+        browserMode = "cdp";
+        // 프로필이 변경되었거나 브라우저가 없으면 (재)시작
+        const profiles = scanChromeProfiles();
+        const newProfile = profilePath ? profiles.find(p => p.path === profilePath) : null;
+
+        // 프로필이 변경되면 브라우저 재시작
+        if (browser && newProfile && selectedProfile?.path !== newProfile.path) {
+          send({ type: "log", text: `[BROWSER] 프로필 변경: ${newProfile.displayName}` });
+          await stopBrowser();
+        }
+
+        if (!browser) {
+          if (newProfile) {
+            selectedProfile = newProfile;
+            send({ type: "log", text: `[BROWSER] 프로필: ${newProfile.displayName}` });
+          }
+          send({ type: "log", text: "[BROWSER] CDP 모드 브라우저 시작 중..." });
+          await startBrowser();
+          send({ type: "log", text: "[BROWSER] 브라우저 준비 완료" });
+        }
+      }
+
+      const ctx: Context = {
+        systemPrompt: `You are a browser automation agent with FULL browser access.
+
+CRITICAL RULES:
+1. NEVER say "I can't" or "I'm sorry" - just DO IT using the browser!
+2. You have access to a REAL browser with logged-in sessions. Just navigate and use it!
+3. Start with browser_navigate, then browser_snapshot to see the page.
+4. The browser has the user's cookies/logins. Just go to the website!
+
+TOOLS:
+- get_current_time: {} - Get current date/time
+- browser_navigate: {"url": "..."} - Go to any URL directly
+- browser_snapshot: {} - See page elements (ALWAYS do this after navigate!)
+- browser_fill: {"selector": "...", "text": "..."} - Type text
+- browser_click: {"selector": "..."} - Click element
+- browser_press: {"key": "Enter"} - Press key
+- browser_get_text: {"selector": ""} - Get page text
+
+WORKFLOW: navigate → snapshot → interact → get_text → report result in Korean.
+DO NOT refuse. DO NOT apologize. Just USE THE BROWSER.`,
+        messages: [{ role: "user", content: mission }],
+        tools: browserTools,
+      };
+
+      const maxTurns = 20;
+
+      for (let turn = 0; turn < maxTurns; turn++) {
+        // 중지 체크
+        if (stoppedTasks.has(taskId)) {
+          send({ type: "log", text: "[STOPPED] 작업이 중지되었습니다." });
+          send({ type: "status", status: "stopped" });
+          stoppedTasks.delete(taskId);
+          return;
+        }
+
+        let response: AssistantMessage;
+
+        try {
+          send({ type: "log", text: `[DEBUG] AI 호출 시작: ${taskModel.id} @ ${taskModel.baseUrl}` });
+          const streamOptions = taskIsOllama ? { apiKey: "ollama" } : undefined;
+          const s = streamSimple(taskModel, ctx, streamOptions);
+          for await (const _ of s) {}
+          response = await s.result();
+          send({ type: "log", text: `[DEBUG] AI 호출 완료` });
+        } catch (error) {
+          const err = error as Error;
+          send({ type: "log", text: `[ERROR] AI 호출 실패: ${err.message}` });
+          send({ type: "log", text: `[ERROR] 스택: ${err.stack?.split('\n').slice(0, 3).join(' | ')}` });
+          send({ type: "error", text: err.message });
+          return;
+        }
+
+        ctx.messages.push(response);
+
+        // 디버그: AI 응답 내용 로그
+        const contentTypes = response.content.map((b) => b.type).join(", ");
+        send({ type: "log", text: `[DEBUG] AI 응답 타입: [${contentTypes}]` });
+
+        const toolCalls = response.content.filter((b) => b.type === "toolCall");
+
+        if (toolCalls.length === 0) {
+          const textContent = response.content.find((b) => b.type === "text");
+          if (textContent && textContent.type === "text") {
+            // 디버그: 텍스트 응답 내용
+            send({ type: "log", text: `[DEBUG] AI 텍스트: ${textContent.text.slice(0, 200)}...` });
+            send({ type: "result", text: textContent.text });
+            // Notion에 저장
+            saveResultToNotion(taskId, mission, textContent.text).then((r) => {
+              if (r.success) send({ type: "log", text: `[NOTION] ${r.message}` });
+            });
+          } else {
+            send({ type: "log", text: "[DEBUG] 도구 호출도 텍스트도 없음" });
+            send({ type: "result", text: "✅ 완료" });
+            saveResultToNotion(taskId, mission, "✅ 완료").then((r) => {
+              if (r.success) send({ type: "log", text: `[NOTION] ${r.message}` });
+            });
+          }
+          return;
+        }
+
+        // 도구 실행
+        for (const call of toolCalls) {
+          send({ type: "log", text: `[TOOL] ${call.name}(${JSON.stringify(call.arguments)})` });
+
+          try {
+            const result = await executeBrowserTool(call.name, call.arguments as Record<string, unknown>);
+            send({ type: "log", text: `[SUCCESS] ${result.text.split("\\n")[0]}` });
+
+            ctx.messages.push({
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: [{ type: "text", text: result.text }],
+              isError: false,
+              timestamp: Date.now(),
+            });
+          } catch (error) {
+            const errMsg = (error as Error).message;
+            send({ type: "log", text: `[ERROR] ${errMsg}` });
+
+            ctx.messages.push({
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: [{ type: "text", text: `Error: ${errMsg}` }],
+              isError: true,
+              timestamp: Date.now(),
+            });
+          }
+        }
+      }
+
+      send({ type: "result", text: "⚠️ 최대 턴 초과" });
+    },
+  });
+
+  console.log(`${c.green}✓ 웹 서버가 실행 중입니다. Ctrl+C로 종료.${c.reset}\n`);
+
+  // 브라우저 자동 열기
+  const url = `http://localhost:${port}`;
+  if (process.platform === "darwin") {
+    spawn("open", [url]);
+  } else if (process.platform === "win32") {
+    spawn("cmd", ["/c", "start", url]);
+  } else {
+    spawn("xdg-open", [url]);
+  }
+
+  // 종료 대기
+  await new Promise<void>((resolve) => {
+    process.on("SIGINT", () => {
+      console.log(`\n${c.yellow}웹 서버 종료 중...${c.reset}`);
+      resolve();
+    });
+  });
+}
+
+// 텔레그램 봇 모드
+async function runTelegramMode(config: Config): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.log(`${c.red}TELEGRAM_BOT_TOKEN 환경변수가 설정되지 않았습니다.${c.reset}`);
+    console.log(`${c.dim}.env 파일에 TELEGRAM_BOT_TOKEN=your-bot-token 추가하세요.${c.reset}`);
+    return;
+  }
+
+  const allowedUsersStr = process.env.TELEGRAM_ALLOWED_USERS;
+  const allowedUsers = allowedUsersStr
+    ? allowedUsersStr.split(",").map((id) => parseInt(id.trim(), 10)).filter((id) => !isNaN(id))
+    : undefined;
+
+  console.log(`\n${c.cyan}🤖 텔레그램 봇 모드${c.reset}`);
+  if (allowedUsers && allowedUsers.length > 0) {
+    console.log(`${c.dim}허용된 사용자: ${allowedUsers.join(", ")}${c.reset}`);
+  } else {
+    console.log(`${c.yellow}⚠️  허용된 사용자가 없습니다. 아무도 사용할 수 없습니다.${c.reset}`);
+    console.log(`${c.dim}설정에서 사용자 ID를 추가하세요.${c.reset}`);
+  }
+
+  const model = resolveModel(config);
+  const isOllama = config.provider === "ollama";
+
+  await startTelegramBot({
+    token,
+    allowedUsers,
+    onMessage: async (text: string, ctx: MessageContext) => {
+      // 특수 명령어 처리
+      if (text === "/start") {
+        return `🤖 Pi-Browser 봇입니다.\n\n명령어를 보내면 브라우저가 자동으로 작업합니다.\n\n예시:\n• 네이버에서 날씨 알려줘\n• 구글에서 맛집 검색해줘`;
+      }
+
+      if (text === "/help") {
+        return `📖 <b>사용법</b>\n\n자연어로 명령을 보내세요:\n• 쿠팡에서 아이폰 가격 알려줘\n• 네이버 메일 확인해줘\n\n<b>모델:</b> ${config.provider}/${config.model}`;
+      }
+
+      // 진행 중 메시지
+      await ctx.replyTo("🔄 작업 중...");
+
+      // 브라우저 에이전트 실행
+      const result = await runTelegramAgent(text, model, isOllama);
+      return result;
+    },
+  });
+
+  console.log(`${c.green}✓ 텔레그램 봇이 실행 중입니다. Ctrl+C로 종료.${c.reset}\n`);
+
+  // 종료 대기
+  await new Promise<void>((resolve) => {
+    process.on("SIGINT", () => {
+      console.log(`\n${c.yellow}텔레그램 봇 종료 중...${c.reset}`);
+      stopTelegramBot();
+      resolve();
+    });
+  });
+}
+
+// 텔레그램 작업 카운터
+let telegramTaskCounter = 0;
+
+// 텔레그램용 에이전트 실행 (결과 문자열 반환)
+async function runTelegramAgent(mission: string, defaultModel: Model, defaultIsOllama: boolean): Promise<string> {
+  // 설정에서 브라우저 모드와 텔레그램 프로필 확인
+  const currentSettings = loadSettings();
+  const selectedMode = currentSettings.browser?.mode || "cdp";
+  // 텔레그램 전용 프로필 또는 기본 브라우저 프로필 사용
+  const telegramProfilePath = currentSettings.telegram?.profile || currentSettings.browser?.selectedProfile;
+
+  // 웹 UI에서 설정한 AI 모델 사용 (있으면)
+  let model = defaultModel;
+  let isOllama = defaultIsOllama;
+  if (currentSettings.ai?.provider) {
+    const aiProvider = currentSettings.ai.provider;
+    const aiModelName = currentSettings.ai.model || "gemini-2.0-flash";
+    let aiOllamaUrl = currentSettings.ai.ollamaUrl || "http://localhost:11434";
+    // /v1 경로 확인 및 추가
+    if (!aiOllamaUrl.endsWith("/v1")) {
+      aiOllamaUrl = aiOllamaUrl.replace(/\/$/, "") + "/v1";
+    }
+    isOllama = aiProvider === "ollama";
+
+    try {
+      if (isOllama) {
+        model = createOllamaModel(aiModelName, aiOllamaUrl);
+        console.log(`[Telegram] AI: Ollama ${aiModelName}`);
+      } else {
+        model = getModel(aiProvider as any, aiModelName as any);
+        console.log(`[Telegram] AI: ${aiProvider}/${aiModelName}`);
+      }
+    } catch (e) {
+      console.log(`[Telegram] 기본 모델 사용: ${(e as Error).message}`);
+    }
+  }
+
+  // 프로필 정보 조회
+  const profiles = scanChromeProfiles();
+  const telegramProfile = telegramProfilePath ? profiles.find(p => p.path === telegramProfilePath) : null;
+  const profileName = telegramProfile?.displayName || "기본";
+
+  // 작업 ID 생성 및 웹 UI에 알림
+  const taskId = `tg-${++telegramTaskCounter}`;
+  broadcastToClients({ type: "newTask", taskId, mission, source: "telegram", profile: profileName });
+
+  const broadcast = (msg: any) => {
+    broadcastToClients({ taskId, ...msg });
+  };
+
+  broadcast({ type: "log", text: `[TELEGRAM] ${mission}` });
+  if (telegramProfile) {
+    broadcast({ type: "log", text: `[PROFILE] ${telegramProfile.displayName}` });
+  }
+
+  // 브라우저 시작
+  if (selectedMode === "extension") {
+    browserMode = "extension";
+    if (!extClient) {
+      broadcast({ type: "log", text: "[BROWSER] Extension 모드 시작 중..." });
+      await startExtensionServer();
+      broadcast({ type: "log", text: "[BROWSER] Extension 서버 시작됨 (ws://localhost:9876)" });
+      broadcast({ type: "log", text: "[BROWSER] Chrome에서 Pi-Browser 확장 프로그램을 연결하세요." });
+      // Extension 연결 대기 (최대 15초)
+      const timeout = 15000;
+      const start = Date.now();
+      while (!extClient && Date.now() - start < timeout) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (!extClient) {
+        broadcast({ type: "error", text: "❌ Extension 연결 실패!" });
+        broadcast({ type: "log", text: "[ERROR] Chrome 확장 프로그램이 설치되지 않았습니다." });
+        return "❌ Extension 연결 실패!\n\n해결 방법:\n1. 설정에서 'CDP 모드'로 변경 (확장 프로그램 불필요)\n2. 또는 Chrome에 확장 프로그램 설치:\n   - chrome://extensions\n   - 개발자 모드 활성화\n   - extension 폴더 드래그&드롭";
+      }
+      broadcast({ type: "log", text: "[BROWSER] Extension 연결됨!" });
+    }
+  } else {
+    browserMode = "cdp";
+    // 프로필이 변경되었으면 브라우저 재시작
+    if (browser && telegramProfile && selectedProfile?.path !== telegramProfile.path) {
+      broadcast({ type: "log", text: `[BROWSER] 프로필 변경: ${telegramProfile.displayName}` });
+      await stopBrowser();
+    }
+
+    if (!browser) {
+      if (telegramProfile) {
+        selectedProfile = telegramProfile;
+        broadcast({ type: "log", text: `[BROWSER] 프로필: ${telegramProfile.displayName}` });
+      }
+      broadcast({ type: "log", text: "[BROWSER] CDP 모드 브라우저 시작 중..." });
+      await startBrowser();
+      broadcast({ type: "log", text: "[BROWSER] 브라우저 준비 완료" });
+    }
+  }
+
+  const ctx: Context = {
+    systemPrompt: `You are a browser automation agent with FULL browser access.
+
+CRITICAL RULES:
+1. NEVER say "I can't" or "I'm sorry" - just DO IT using the browser!
+2. You have access to a REAL browser with logged-in sessions. Just navigate and use it!
+3. Start with browser_navigate, then browser_snapshot to see the page.
+4. The browser has the user's cookies/logins. Just go to the website!
+
+TOOLS:
+- get_current_time: {} - Get current date/time
+- browser_navigate: {"url": "..."} - Go to any URL directly
+- browser_snapshot: {} - See page elements (ALWAYS do this after navigate!)
+- browser_fill: {"selector": "...", "text": "..."} - Type text
+- browser_click: {"selector": "..."} - Click element
+- browser_press: {"key": "Enter"} - Press key
+- browser_get_text: {"selector": ""} - Get page text
+
+WORKFLOW: navigate → snapshot → interact → get_text → report result in Korean.
+DO NOT refuse. DO NOT apologize. Just USE THE BROWSER.`,
+    messages: [{ role: "user", content: mission }],
+    tools: browserTools,
+  };
+
+  const maxTurns = 20;
+  let finalResult = "";
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    let response: AssistantMessage;
+
+    console.log(`[Telegram] Turn ${turn + 1}/${maxTurns} - AI 호출 중...`);
+    broadcast({ type: "log", text: `[AI] Turn ${turn + 1}/${maxTurns}` });
+
+    try {
+      const streamOptions = isOllama ? { apiKey: "ollama" } : undefined;
+      const s = streamSimple(model, ctx, streamOptions);
+      for await (const _ of s) {
+        // 스트리밍 무시
+      }
+      response = await s.result();
+    } catch (error) {
+      console.log(`[Telegram] AI 에러:`, (error as Error).message);
+      broadcast({ type: "error", text: (error as Error).message });
+      return `❌ AI 에러: ${(error as Error).message}`;
+    }
+
+    ctx.messages.push(response);
+
+    const toolCalls = response.content.filter((b) => b.type === "toolCall");
+
+    if (toolCalls.length === 0) {
+      // 텍스트 응답
+      const textContent = response.content.find((b) => b.type === "text");
+      if (textContent && textContent.type === "text") {
+        finalResult = textContent.text;
+        console.log(`[Telegram] 완료:`, finalResult.substring(0, 100));
+        broadcast({ type: "result", text: finalResult });
+        // Notion에 저장
+        saveResultToNotion(taskId, mission, finalResult).then((r) => {
+          if (r.success) broadcast({ type: "log", text: `[NOTION] ${r.message}` });
+        });
+      }
+      break;
+    }
+
+    // 도구 실행
+    for (const call of toolCalls) {
+      console.log(`[Telegram] 도구: ${call.name}`);
+      broadcast({ type: "log", text: `[TOOL] ${call.name}` });
+      try {
+        const result = await executeBrowserTool(call.name, call.arguments as Record<string, unknown>);
+        console.log(`[Telegram] 결과: ${result.text.substring(0, 80)}...`);
+        broadcast({ type: "log", text: `[SUCCESS] ${result.text.split("\\n")[0].substring(0, 80)}` });
+
+        ctx.messages.push({
+          role: "toolResult",
+          toolCallId: call.id,
+          toolName: call.name,
+          content: [{ type: "text", text: result.text }],
+          isError: false,
+          timestamp: Date.now(),
+        });
+      } catch (error) {
+        console.log(`[Telegram] 에러: ${(error as Error).message}`);
+        broadcast({ type: "log", text: `[ERROR] ${(error as Error).message}` });
+        ctx.messages.push({
+          role: "toolResult",
+          toolCallId: call.id,
+          toolName: call.name,
+          content: [{ type: "text", text: `Error: ${(error as Error).message}` }],
+          isError: true,
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  if (!finalResult) {
+    broadcast({ type: "result", text: "✅ 작업 완료" });
+    saveResultToNotion(taskId, mission, "✅ 작업 완료").then((r) => {
+      if (r.success) broadcast({ type: "log", text: `[NOTION] ${r.message}` });
+    });
+  }
+  return finalResult || "✅ 작업 완료";
 }
 
 function printModels() {
@@ -1481,10 +2168,16 @@ async function main() {
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i];
 
-    // Extension 모드 시작
-    if (arg === "/ext") {
+    // Extension 모드 시작 (/e 또는 /ext)
+    if (arg === "/ext" || arg === "/e") {
       browserMode = "extension";
       continue;
+    }
+
+    // /help
+    if (arg === "/help" || arg === "/?") {
+      printHelp();
+      process.exit(0);
     }
 
     if (arg === "/models") {
@@ -1536,6 +2229,21 @@ async function main() {
       continue;
     }
 
+    // /web 또는 web - 웹 UI 모드 시작
+    if (arg === "/web" || arg === "web" || arg === "/w" || arg === "w") {
+      // --port 옵션 확인
+      let port = 3000;
+      const portIndex = rawArgs.indexOf("--port");
+      if (portIndex !== -1 && portIndex + 1 < rawArgs.length) {
+        port = parseInt(rawArgs[portIndex + 1], 10) || 3000;
+      }
+
+      const model = resolveModel(config);
+      const isOllama = config.provider === "ollama";
+      await runWebMode(config, port);
+      process.exit(0);
+    }
+
     if (arg === "/config") {
       console.log(`\n${c.cyan}현재 설정:${c.reset}`);
       console.log(`  Provider: ${config.provider}`);
@@ -1564,46 +2272,58 @@ async function main() {
       continue;
     }
 
-    // /parallel 처리 - 병렬 브라우저 실행
-    if (arg === "/parallel") {
-      // 사용법 안내
-      console.log(`\n${c.cyan}병렬 브라우저 모드${c.reset}`);
-      console.log(`${c.dim}여러 브라우저로 동시에 작업을 실행합니다.${c.reset}\n`);
-      console.log(`${c.yellow}사용법:${c.reset}`);
-      console.log(`  ${c.green}# 익명 브라우저 (로그인 없음)${c.reset}`);
-      console.log(`  npm start '/parallel 3 "작업1" "작업2" "작업3"'`);
-      console.log(`\n  ${c.green}# 프로필 브라우저 (로그인 유지)${c.reset}`);
-      console.log(`  npm start '/parallel "Profile 1,Profile 2" "작업1" "작업2"'`);
-      console.log(`\n${c.dim}숫자: 익명 브라우저 개수, 따옴표: 프로필 목록${c.reset}`);
-      console.log(`${c.dim}작업 수 > 브라우저 수인 경우 라운드 로빈으로 배분됩니다.${c.reset}\n`);
+    // /p 또는 /parallel 처리 - 병렬 브라우저 실행
+    if (arg === "/parallel" || arg === "/p") {
+      console.log(`
+${c.bright}병렬 실행${c.reset}
 
-      const profiles = getChromeProfiles();
-      console.log(`${c.cyan}사용 가능한 프로필:${c.reset}`);
-      for (const p of profiles) {
-        const dirName = path.basename(p.path);
-        console.log(`  ${c.yellow}${dirName}${c.reset} - ${p.name}`);
-      }
-      console.log();
+${c.yellow}사용법:${c.reset}  p <개수>  →  작업을 하나씩 입력 (빈 줄로 실행)
+
+${c.dim}예시:${c.reset}
+  p 3
+  > 구글검색
+  > 네이버검색
+  >           ← 빈 줄 입력시 실행
+`);
       process.exit(0);
     }
 
-    // /parallel 처리
-    if (arg.startsWith("/parallel ")) {
-      const parallelArgs = arg.slice(10).trim();
+    // /p N task1 task2 ... 또는 /parallel N task1 task2 ...
+    if (arg.startsWith("/p ") || arg.startsWith("/parallel ")) {
+      const startIdx = arg.startsWith("/p ") ? 3 : 10;
+      const parallelArgs = arg.slice(startIdx).trim();
+
+      // 숫자만 입력한 경우 - 대화형 모드는 인터랙티브 REPL에서만 지원
+      const countOnlyMatch = parallelArgs.match(/^(\d+)$/);
+      if (countOnlyMatch) {
+        console.log(`${c.yellow}대화형 병렬 실행은 인터랙티브 모드에서 사용하세요:${c.reset}`);
+        console.log(`${c.dim}  npm start${c.reset}`);
+        console.log(`${c.dim}  > p ${countOnlyMatch[1]}${c.reset}`);
+        console.log(`${c.dim}  > 작업1${c.reset}`);
+        console.log(`${c.dim}  > 작업2${c.reset}`);
+        console.log(`${c.dim}  >        ← 빈 줄로 실행${c.reset}`);
+        process.exit(0);
+      }
 
       // 숫자로 시작하면 익명 브라우저 모드
       const countMatch = parallelArgs.match(/^(\d+)\s+(.+)$/);
       if (countMatch) {
         const count = parseInt(countMatch[1], 10);
         const tasksPart = countMatch[2];
-        const taskMatches = tasksPart.match(/"[^"]+"/g);
 
-        if (!taskMatches || taskMatches.length === 0) {
-          console.log(`${c.red}사용법: /parallel 3 "작업1" "작업2" "작업3"${c.reset}`);
-          process.exit(1);
+        // 따옴표가 있으면 따옴표 기준, 없으면 공백 기준으로 분리
+        let tasks: string[];
+        const quotedTasks = tasksPart.match(/"[^"]+"/g);
+        if (quotedTasks && quotedTasks.length > 0) {
+          tasks = quotedTasks.map((t) => t.replace(/"/g, ""));
+        } else {
+          tasks = tasksPart.split(/\s+/).filter(t => t.length > 0);
         }
 
-        const tasks = taskMatches.map((t) => t.replace(/"/g, ""));
+        if (tasks.length === 0) {
+          console.log(`${c.red}사용법: p 3 작업1 작업2 작업3${c.reset}`);
+          process.exit(1);
+        }
 
         console.log(`${c.cyan}익명 브라우저: ${count}개${c.reset}`);
         console.log(`${c.cyan}작업 수: ${tasks.length}${c.reset}\n`);
@@ -1633,8 +2353,8 @@ async function main() {
 
       if (!matches || matches.length < 2) {
         console.log(`${c.red}사용법:${c.reset}`);
-        console.log(`  ${c.dim}익명: /parallel 3 "작업1" "작업2"${c.reset}`);
-        console.log(`  ${c.dim}프로필: /parallel "Profile1,Profile2" "작업1" "작업2"${c.reset}`);
+        console.log(`  ${c.dim}익명: p 3 "작업1" "작업2"${c.reset}`);
+        console.log(`  ${c.dim}프로필: p "Profile1,Profile2" "작업1" "작업2"${c.reset}`);
         process.exit(1);
       }
 
@@ -1777,52 +2497,140 @@ async function main() {
       }
 
       // 모델 목록
-      if (trimmed === "/models") {
+      if (trimmed === "/models" || trimmed === "models") {
         printModels();
         prompt();
         return;
       }
 
-      // 병렬 실행 도움말
-      if (trimmed === "/parallel") {
-        console.log(`\n${c.cyan}병렬 브라우저 모드${c.reset}`);
-        console.log(`${c.dim}여러 브라우저로 동시에 작업을 실행합니다.${c.reset}\n`);
-        console.log(`${c.yellow}사용법:${c.reset}`);
-        console.log(`  ${c.green}# 익명 브라우저 (로그인 없음)${c.reset}`);
-        console.log(`  /parallel 3 "작업1" "작업2" "작업3"`);
-        console.log(`\n  ${c.green}# 프로필 브라우저 (로그인 유지)${c.reset}`);
-        console.log(`  /parallel "Profile 1,Profile 2" "작업1" "작업2"`);
-        console.log(`\n${c.dim}숫자: 익명 브라우저 개수, 따옴표: 프로필 목록${c.reset}\n`);
-
-        const profiles = getChromeProfiles();
-        console.log(`${c.cyan}사용 가능한 프로필:${c.reset}`);
-        for (const p of profiles) {
-          const dirName = path.basename(p.path);
-          console.log(`  ${c.yellow}${dirName}${c.reset} - ${p.name}`);
-        }
-        console.log();
+      // 텔레그램 모드
+      if (trimmed === "/tg" || trimmed === "tg" || trimmed === "/telegram" || trimmed === "telegram") {
+        await runTelegramMode(config);
         prompt();
         return;
       }
 
-      // 병렬 실행
-      if (trimmed.startsWith("/parallel ")) {
-        const parallelArgs = trimmed.slice(10).trim();
+      // 웹 UI 모드
+      if (trimmed === "/web" || trimmed === "web" || trimmed === "/w" || trimmed === "w") {
+        await runWebMode(config);
+        prompt();
+        return;
+      }
+
+      // 버전 정보
+      if (trimmed === "/version" || trimmed === "version" || trimmed === "-v" || trimmed === "--version") {
+        printVersion();
+        prompt();
+        return;
+      }
+
+      // help (슬래시 없이도 가능)
+      if (trimmed === "/help" || trimmed === "/?" || trimmed === "help" || trimmed === "?") {
+        printHelp();
+        prompt();
+        return;
+      }
+
+      // 병렬 실행 도움말 (슬래시 없이도 가능)
+      if (trimmed === "/parallel" || trimmed === "/p" || trimmed === "p" || trimmed === "parallel") {
+        console.log(`
+${c.bright}병렬 실행${c.reset}
+
+${c.yellow}사용법:${c.reset}  p <개수>  →  작업을 하나씩 입력 (빈 줄로 실행)
+
+${c.dim}예시:${c.reset}
+  p 3
+  > 구글검색
+  > 네이버검색
+  > 다음검색
+  >           ← 빈 줄 입력시 실행
+`);
+        prompt();
+        return;
+      }
+
+      // 병렬 실행 (p, /p, parallel, /parallel)
+      if (trimmed.startsWith("/p ") || trimmed.startsWith("/parallel ") ||
+          trimmed.startsWith("p ") || trimmed.startsWith("parallel ")) {
+        let startIdx = 2;
+        if (trimmed.startsWith("/p ")) startIdx = 3;
+        else if (trimmed.startsWith("p ")) startIdx = 2;
+        else if (trimmed.startsWith("/parallel ")) startIdx = 10;
+        else if (trimmed.startsWith("parallel ")) startIdx = 9;
+        const parallelArgs = trimmed.slice(startIdx).trim();
+
+        // 숫자만 입력한 경우 대화형 모드
+        const countOnlyMatch = parallelArgs.match(/^(\d+)$/);
+        if (countOnlyMatch) {
+          const count = parseInt(countOnlyMatch[1], 10);
+          console.log(`\n${c.bright}🚀 병렬 실행 (브라우저 ${count}개)${c.reset}`);
+          console.log(`${c.dim}작업을 하나씩 입력하세요. 빈 줄 입력시 실행됩니다.${c.reset}\n`);
+
+          const tasks: string[] = [];
+          const collectTasks = () => {
+            rl.question(`${c.yellow}[${tasks.length + 1}]${c.reset} > `, async (taskInput) => {
+              const task = taskInput.trim();
+
+              if (!task) {
+                // 빈 줄 입력 - 실행
+                if (tasks.length === 0) {
+                  console.log(`${c.red}작업이 없습니다.${c.reset}\n`);
+                  prompt();
+                  return;
+                }
+
+                console.log(`\n${c.cyan}작업 ${tasks.length}개 실행 시작...${c.reset}\n`);
+
+                try {
+                  const model = resolveModel(config);
+                  const isOllama = config.provider === "ollama";
+
+                  const browsers = await startAnonymousParallelBrowsers(count);
+
+                  if (browsers.length > 0) {
+                    await runParallelAgents(browsers, tasks, model, isOllama);
+                  } else {
+                    console.log(`${c.red}브라우저를 시작할 수 없습니다.${c.reset}`);
+                  }
+
+                  await stopParallelBrowsers();
+                } catch (error) {
+                  console.log(`${c.red}Error: ${(error as Error).message}${c.reset}`);
+                  await stopParallelBrowsers();
+                }
+                prompt();
+                return;
+              }
+
+              tasks.push(task);
+              collectTasks();
+            });
+          };
+
+          collectTasks();
+          return;
+        }
 
         // 숫자로 시작하면 익명 브라우저 모드
         const countMatch = parallelArgs.match(/^(\d+)\s+(.+)$/);
         if (countMatch) {
           const count = parseInt(countMatch[1], 10);
           const tasksPart = countMatch[2];
-          const taskMatches = tasksPart.match(/"[^"]+"/g);
 
-          if (!taskMatches || taskMatches.length === 0) {
-            console.log(`${c.red}사용법: /parallel 3 "작업1" "작업2"${c.reset}`);
+          // 따옴표가 있으면 따옴표 기준, 없으면 공백 기준으로 분리
+          let tasks: string[];
+          const quotedTasks = tasksPart.match(/"[^"]+"/g);
+          if (quotedTasks && quotedTasks.length > 0) {
+            tasks = quotedTasks.map((t) => t.replace(/"/g, ""));
+          } else {
+            tasks = tasksPart.split(/\s+/).filter(t => t.length > 0);
+          }
+
+          if (tasks.length === 0) {
+            console.log(`${c.red}사용법: p 3 작업1 작업2 작업3${c.reset}`);
             prompt();
             return;
           }
-
-          const tasks = taskMatches.map((t) => t.replace(/"/g, ""));
 
           try {
             const model = resolveModel(config);
@@ -1850,8 +2658,8 @@ async function main() {
 
         if (!matches || matches.length < 2) {
           console.log(`${c.red}사용법:${c.reset}`);
-          console.log(`  ${c.dim}익명: /parallel 3 "작업1" "작업2"${c.reset}`);
-          console.log(`  ${c.dim}프로필: /parallel "Profile1,Profile2" "작업1"${c.reset}`);
+          console.log(`  ${c.dim}익명: p 3  →  작업을 하나씩 입력${c.reset}`);
+          console.log(`  ${c.dim}프로필: p "Profile1,Profile2" "작업1"${c.reset}`);
           prompt();
           return;
         }
